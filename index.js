@@ -8,12 +8,11 @@ const MODULE_NAME = 'user_reply_helper';
 const defaultSettings = Object.freeze({
     enabled: true,
     customSystemPrompt: '',
-    insertMode: 'insert', // 'insert' | 'confirm'
-    language: 'auto',    // 'auto' | 'en' | 'ru' | etc.
-    maxTokens: 200,
+    insertMode: 'insert',
+    language: 'auto',
 });
 
-// ─── Settings helpers ────────────────────────────────────────────────────────
+// ─── Settings ────────────────────────────────────────────────────────────────
 
 function getSettings() {
     const { extensionSettings } = SillyTavern.getContext();
@@ -29,83 +28,110 @@ function getSettings() {
 }
 
 function saveSettings() {
-    const { saveSettingsDebounced } = SillyTavern.getContext();
-    saveSettingsDebounced();
+    SillyTavern.getContext().saveSettingsDebounced();
 }
 
-// ─── Core logic ──────────────────────────────────────────────────────────────
+// ─── Think-tag stripping ──────────────────────────────────────────────────────
 
 /**
- * Build the last N messages of chat history as a readable string for the prompt.
+ * Strip reasoning blocks from model output.
+ * Handles Qwen3 (<think>), DeepSeek-R1 (<think>), QwQ, and partial/unclosed tags.
  */
-function buildChatContext(chat, maxMessages = 10) {
-    const recent = chat.slice(-maxMessages);
-    return recent
-        .map(m => {
-            const speaker = m.is_user ? 'User' : (m.name || 'Character');
-            return `${speaker}: ${m.mes}`;
-        })
+function stripThinkingBlocks(text) {
+    if (!text) return text;
+
+    // Remove complete blocks
+    let r = text
+        .replace(/<think>[\s\S]*?<\/think>/gi, '')
+        .replace(/<thinking>[\s\S]*?<\/thinking>/gi, '');
+
+    // Remove unclosed opening tag + everything after
+    r = r
+        .replace(/<think>[\s\S]*/gi, '')
+        .replace(/<thinking>[\s\S]*/gi, '');
+
+    // Remove orphaned closing tag + everything before (got only the tail)
+    r = r
+        .replace(/[\s\S]*<\/think>/gi, '')
+        .replace(/[\s\S]*<\/thinking>/gi, '');
+
+    return r.trim();
+}
+
+// ─── Prompt building ──────────────────────────────────────────────────────────
+
+function buildChatContext(chat, maxMessages = 12) {
+    return chat.slice(-maxMessages)
+        .map(m => `[${m.is_user ? 'User' : (m.name || 'Character')}]: ${m.mes}`)
         .join('\n');
 }
 
+function getCurrentCharacterName() {
+    const ctx = SillyTavern.getContext();
+    if (ctx.groupId) {
+        const last = [...ctx.chat].reverse().find(m => !m.is_user);
+        return last?.name || 'Character';
+    }
+    return ctx.characters[ctx.characterId]?.name || 'Character';
+}
+
 /**
- * Build the system prompt that forces the model to produce ONLY a user reply.
+ * System prompt strategy:
+ * 1. /no_think on line 1 — Qwen3 soft-switch (works in system prompt)
+ * 2. Role definition as ghostwriter, NOT as character
+ * 3. Prohibitions listed BEFORE instructions (early-token weighting)
+ * 4. Concrete right/wrong output examples
  */
 function buildSystemPrompt(settings, characterName) {
-    const langInstruction = (() => {
-        if (settings.language === 'auto') return '';
-        if (settings.language === 'ru') return ' Reply in Russian.';
-        if (settings.language === 'en') return ' Reply in English.';
-        return ` Reply in ${settings.language}.`;
-    })();
+    const langLine = settings.language === 'ru'
+        ? '\nWrite the reply in Russian.'
+        : settings.language === 'en'
+            ? '\nWrite the reply in English.'
+            : '';
 
-    const custom = settings.customSystemPrompt ? `\n\n${settings.customSystemPrompt}` : '';
+    const custom = settings.customSystemPrompt
+        ? `\n\nAdditional style instructions:\n${settings.customSystemPrompt}`
+        : '';
 
-    return (
-        `You are a writing assistant helping the USER compose their next message in an ongoing roleplay conversation with a character named "${characterName || 'the character'}".\n\n` +
-        `YOUR TASK:\n` +
-        `Write ONLY the user's next reply — a single, in-character message from the user's perspective.\n\n` +
-        `STRICT RULES:\n` +
-        `- Output ONLY the reply text. No explanations, no labels, no quotes, no preamble.\n` +
-        `- Do NOT write as the character. Do NOT continue the character's dialogue.\n` +
-        `- Do NOT add stage directions, actions, or narration unless the user's style already uses them.\n` +
-        `- Do NOT start with "User:", "Me:", or any prefix.\n` +
-        `- Keep the reply natural and consistent with the user's tone in the conversation.` +
-        langInstruction +
-        custom
-    );
+    return `/no_think
+You are a ghostwriter helping a human compose their next message in a roleplay chat.
+
+YOUR ONLY JOB:
+Write the next message FROM THE HUMAN/USER's perspective — one short, natural reply.
+
+ABSOLUTE PROHIBITIONS:
+- DO NOT write as ${characterName} or continue ${characterName}'s lines.
+- DO NOT produce <think>, <thinking>, or any XML/reasoning tags whatsoever.
+- DO NOT add a speaker label or prefix (no "User:", "Me:", "Reply:", "[User]:").
+- DO NOT write more than one message or add narration/stage directions.
+- DO NOT explain what you are doing. DO NOT comment on the task.
+- DO NOT output anything except the reply text itself.
+
+CORRECT output examples:
+  Хм, ты правда так думаешь? Мне интересно почему.
+  That's a strange thing to say. Tell me more.
+
+WRONG output examples:
+  [User]: Хм, ты правда...          ← has a label
+  <think>Let me think...</think> Hmm  ← has a think block
+  ${characterName}: продолжает...    ← writing as the character
+${langLine}${custom}`;
 }
 
-/**
- * Get the name of the current character (handles groups too).
- */
-function getCurrentCharacterName() {
-    const context = SillyTavern.getContext();
-    if (context.groupId) {
-        // In a group, find the last character who spoke
-        const lastCharMsg = [...context.chat].reverse().find(m => !m.is_user);
-        return lastCharMsg?.name || 'the character';
-    }
-    return context.characters[context.characterId]?.name || 'the character';
-}
+// ─── Core generation ──────────────────────────────────────────────────────────
 
-/**
- * Main generation function.
- */
 async function generateUserReply() {
-    const context = SillyTavern.getContext();
-    const { chat, generateRaw } = context;
+    const ctx = SillyTavern.getContext();
+    const { chat, generateRaw } = ctx;
     const settings = getSettings();
 
     if (!chat || chat.length === 0) {
         toastr.warning('No chat history found.');
         return;
     }
-
-    // Find the last character message
     const lastCharMsg = [...chat].reverse().find(m => !m.is_user);
     if (!lastCharMsg) {
-        toastr.warning('No character message found to reply to.');
+        toastr.warning('No character message to reply to yet.');
         return;
     }
 
@@ -113,12 +139,12 @@ async function generateUserReply() {
     const systemPrompt = buildSystemPrompt(settings, characterName);
     const chatContext = buildChatContext(chat);
 
+    // Short imperative user-turn — reasoning models degrade with verbose prompts
     const userPrompt =
-        `Here is the recent conversation:\n\n${chatContext}\n\n` +
-        `Now write the user's next reply to ${characterName}'s last message. ` +
-        `Output ONLY the reply text — nothing else.`;
+        `Conversation so far:\n\n${chatContext}\n\n` +
+        `Write the User's next reply to ${characterName}'s last message. ` +
+        `Output the reply text only — no labels, no tags, nothing else.`;
 
-    // Show spinner on the button
     const btn = document.getElementById('urh_generate_btn');
     if (btn) {
         btn.disabled = true;
@@ -126,37 +152,46 @@ async function generateUserReply() {
     }
 
     try {
-        const result = await generateRaw({
-            systemPrompt,
-            prompt: userPrompt,
-        });
+        let result = await generateRaw({ systemPrompt, prompt: userPrompt });
 
         if (!result || !result.trim()) {
             toastr.error('Model returned an empty reply. Try again.');
             return;
         }
 
-        const cleaned = result.trim();
+        // Strip think blocks — always, unconditionally
+        result = stripThinkingBlocks(result);
+
+        // Strip stubborn speaker labels
+        result = result
+            .replace(/^\[?User\]?:\s*/i, '')
+            .replace(/^\[?Пользователь\]?:\s*/iu, '')
+            .replace(/^\[?Me\]?:\s*/i, '')
+            .trim();
+
+        if (!result) {
+            toastr.error('Output was empty after cleanup. Try again.');
+            return;
+        }
 
         if (settings.insertMode === 'confirm') {
             const { Popup, POPUP_TYPE, POPUP_RESULT } = SillyTavern.getContext();
             const popup = new Popup(
-                `<div style="white-space:pre-wrap; padding:8px;">${escapeHtml(cleaned)}</div>`,
+                `<div style="white-space:pre-wrap;padding:10px;line-height:1.6;">${escapeHtml(result)}</div>`,
                 POPUP_TYPE.CONFIRM,
                 '',
-                { okButton: 'Use this reply', cancelButton: 'Discard' }
+                { okButton: '✓ Use this reply', cancelButton: 'Discard' }
             );
-            const res = await popup.show();
-            if (res === POPUP_RESULT.AFFIRMATIVE) {
-                insertIntoTextarea(cleaned);
+            if (await popup.show() === POPUP_RESULT.AFFIRMATIVE) {
+                insertIntoTextarea(result);
             }
         } else {
-            insertIntoTextarea(cleaned);
+            insertIntoTextarea(result);
         }
 
     } catch (err) {
-        console.error(`[${MODULE_NAME}] Generation error:`, err);
-        toastr.error('Failed to generate reply. Check console for details.');
+        console.error(`[${MODULE_NAME}]`, err);
+        toastr.error('Generation failed. Check the browser console.');
     } finally {
         if (btn) {
             btn.disabled = false;
@@ -165,77 +200,57 @@ async function generateUserReply() {
     }
 }
 
-/**
- * Insert text into the send textarea, triggering proper events.
- */
 function insertIntoTextarea(text) {
-    const textarea = document.getElementById('send_textarea');
-    if (!textarea) return;
-
-    const current = textarea.value;
-    textarea.value = current ? `${current}\n${text}` : text;
-
-    // Trigger input event so ST updates its internal state (char counter, etc.)
-    textarea.dispatchEvent(new Event('input', { bubbles: true }));
-    textarea.focus();
+    const ta = document.getElementById('send_textarea');
+    if (!ta) return;
+    ta.value = ta.value ? `${ta.value}\n${text}` : text;
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
+    ta.focus();
 }
 
-/**
- * Simple HTML escape to prevent XSS in popup preview.
- */
 function escapeHtml(str) {
     return str
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;');
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
-// ─── UI: button in send bar ──────────────────────────────────────────────────
+// ─── UI: send-bar button ──────────────────────────────────────────────────────
 
 function injectButton() {
-    if (document.getElementById('urh_generate_btn')) return; // already injected
+    if (document.getElementById('urh_generate_btn')) return;
 
     const btn = document.createElement('div');
     btn.id = 'urh_generate_btn';
     btn.className = 'urh-btn interactable';
-    btn.title = 'Generate user reply suggestion';
+    btn.title = 'Generate user reply suggestion (User Reply Helper)';
     btn.innerHTML = '<i class="fa-solid fa-reply"></i>';
     btn.setAttribute('tabindex', '0');
+    btn.setAttribute('role', 'button');
 
     btn.addEventListener('click', () => {
-        const settings = getSettings();
-        if (!settings.enabled) {
-            toastr.info('User Reply Helper is disabled.');
+        if (!getSettings().enabled) {
+            toastr.info('User Reply Helper is disabled. Enable it in Extensions settings.');
             return;
         }
         generateUserReply();
     });
 
-    // Keyboard accessibility
-    btn.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' || e.key === ' ') {
-            e.preventDefault();
-            btn.click();
-        }
+    btn.addEventListener('keydown', e => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); btn.click(); }
     });
 
-    // Insert before the send button
     const sendBtn = document.getElementById('send_but');
-    if (sendBtn && sendBtn.parentNode) {
+    if (sendBtn?.parentNode) {
         sendBtn.parentNode.insertBefore(btn, sendBtn);
     } else {
-        // Fallback: append to send_form
-        const form = document.getElementById('send_form');
-        if (form) form.appendChild(btn);
+        document.getElementById('send_form')?.appendChild(btn);
     }
 }
 
 // ─── UI: settings panel ──────────────────────────────────────────────────────
 
 function buildSettingsPanel() {
-    const settings = getSettings();
-
+    const s = getSettings();
     const html = `
 <div class="inline-drawer">
     <div class="inline-drawer-toggle inline-drawer-header">
@@ -243,83 +258,70 @@ function buildSettingsPanel() {
         <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
     </div>
     <div class="inline-drawer-content">
-
         <div class="urh-row">
             <label class="checkbox_label">
-                <input id="urh_enabled" type="checkbox" ${settings.enabled ? 'checked' : ''} />
+                <input id="urh_enabled" type="checkbox" ${s.enabled ? 'checked' : ''} />
                 <span>Enable extension</span>
             </label>
         </div>
-
         <div class="urh-row">
             <label for="urh_insert_mode">After generation:</label>
             <select id="urh_insert_mode" class="text_pole">
-                <option value="insert" ${settings.insertMode === 'insert' ? 'selected' : ''}>Insert directly into input</option>
-                <option value="confirm" ${settings.insertMode === 'confirm' ? 'selected' : ''}>Show preview, ask confirmation</option>
+                <option value="insert"  ${s.insertMode === 'insert'  ? 'selected' : ''}>Insert directly into input</option>
+                <option value="confirm" ${s.insertMode === 'confirm' ? 'selected' : ''}>Show preview, confirm before inserting</option>
             </select>
         </div>
-
         <div class="urh-row">
             <label for="urh_language">Reply language:</label>
             <select id="urh_language" class="text_pole">
-                <option value="auto" ${settings.language === 'auto' ? 'selected' : ''}>Auto (match conversation)</option>
-                <option value="en" ${settings.language === 'en' ? 'selected' : ''}>English</option>
-                <option value="ru" ${settings.language === 'ru' ? 'selected' : ''}>Русский</option>
+                <option value="auto" ${s.language === 'auto' ? 'selected' : ''}>Auto (match conversation)</option>
+                <option value="en"   ${s.language === 'en'   ? 'selected' : ''}>English</option>
+                <option value="ru"   ${s.language === 'ru'   ? 'selected' : ''}>Русский</option>
             </select>
         </div>
-
         <div class="urh-row">
-            <label for="urh_custom_prompt">Custom instructions for the model <small>(optional)</small>:</label>
-            <textarea id="urh_custom_prompt" class="text_pole" rows="3" placeholder="e.g. Keep replies short and sarcastic.">${settings.customSystemPrompt}</textarea>
+            <label for="urh_custom_prompt">Custom style instructions <small>(optional)</small>:</label>
+            <textarea id="urh_custom_prompt" class="text_pole" rows="3"
+                placeholder="e.g. Keep replies short and sarcastic. Never use exclamation marks."
+            >${s.customSystemPrompt}</textarea>
         </div>
-
         <div class="urh-hint">
             <i class="fa-solid fa-circle-info"></i>
-            The model is strictly instructed to output <em>only</em> the user's reply text — no labels, no character lines, no preamble.
+            Qwen3: <code>/no_think</code> is injected automatically.<br>
+            DeepSeek-R1 &amp; others: <code>&lt;think&gt;</code> blocks are always stripped from output.
         </div>
-
     </div>
 </div>`;
 
-    const container = document.createElement('div');
-    container.innerHTML = html;
-    document.getElementById('extensions_settings2')?.appendChild(container);
+    const wrap = document.createElement('div');
+    wrap.innerHTML = html;
+    document.getElementById('extensions_settings2')?.appendChild(wrap);
 
-    // Wire events
     document.getElementById('urh_enabled')?.addEventListener('change', e => {
-        getSettings().enabled = e.target.checked;
-        saveSettings();
+        getSettings().enabled = e.target.checked; saveSettings();
     });
-
     document.getElementById('urh_insert_mode')?.addEventListener('change', e => {
-        getSettings().insertMode = e.target.value;
-        saveSettings();
+        getSettings().insertMode = e.target.value; saveSettings();
     });
-
     document.getElementById('urh_language')?.addEventListener('change', e => {
-        getSettings().language = e.target.value;
-        saveSettings();
+        getSettings().language = e.target.value; saveSettings();
     });
-
     document.getElementById('urh_custom_prompt')?.addEventListener('input', e => {
-        getSettings().customSystemPrompt = e.target.value;
-        saveSettings();
+        getSettings().customSystemPrompt = e.target.value; saveSettings();
     });
 }
 
-// ─── Lifecycle ───────────────────────────────────────────────────────────────
+// ─── Lifecycle ────────────────────────────────────────────────────────────────
 
 export async function onActivate() {
-    console.log(`[${MODULE_NAME}] Activating...`);
-    getSettings(); // initialize defaults
+    console.log(`[${MODULE_NAME}] Activated.`);
+    getSettings();
 }
 
 (async () => {
     const { eventSource, event_types } = SillyTavern.getContext();
-
-    // Wait for the app to be fully ready
-    eventSource.on(event_types.APP_READY, async () => {
-        console.log(`[${MODULE_NAME}] App ready, injecting UI...`);
+    eventSource.on(event_types.APP_READY, () => {
+        console.log(`[${MODULE_NAME}] Injecting UI...`);
         injectButton();
         buildSettingsPanel();
     });
