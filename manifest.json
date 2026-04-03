@@ -6,7 +6,7 @@
     "dependencies": [],
     "js": "index.js",
     "css": "style.css",
-    "author": "Your Name",
+    "author": "stitchmod",
     "version": "1.0.0",
     "homePage": "https://github.com/your-username/SillyTavern-UserReplyHelper",
     "auto_update": true,
