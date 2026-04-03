@@ -1,0 +1,16 @@
+{
+    "display_name": "User Reply Helper",
+    "loading_order": 50,
+    "requires": [],
+    "optional": [],
+    "dependencies": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "Your Name",
+    "version": "1.0.0",
+    "homePage": "https://github.com/your-username/SillyTavern-UserReplyHelper",
+    "auto_update": true,
+    "hooks": {
+        "activate": "onActivate"
+    }
+}
